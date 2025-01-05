@@ -108,8 +108,8 @@ def get_all_video_from_channel(channel_url, video_dict={}):
 
     # Duyệt qua từng video
     for index, element in enumerate(elements, start=1):
-        if index == 2:
-            break
+        # if index == 2:
+        #     break
         print(f"Processing video element {index}...")
         try:
             # Lấy tên video
