@@ -145,7 +145,7 @@ def get_all_video_from_channel(channel_url, video_dict={}):
 
 def get_video_and_audio_url(video_dict):
     # Nếu bạn muốn headless, bỏ comment
-    options.add_argument('--headless')
+    # options.add_argument('--headless')
     
     for channel in video_dict.values():
         for video in channel.values():
