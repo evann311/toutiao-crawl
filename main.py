@@ -144,8 +144,8 @@ def get_all_video_from_channel(channel_url, video_dict={}):
 
 
 def get_video_and_audio_url(video_dict):
-    # Nếu bạn muốn headless, bỏ comment
-    # options.add_argument('--headless')
+    if HEADLESS:
+        options.add_argument('--headless')
     
     for channel in video_dict.values():
         for video in channel.values():
@@ -161,9 +161,9 @@ def get_video_and_audio_url(video_dict):
             audio_url = None
 
             while not (video_url and audio_url):
-                logs = driver.get_log("performance")
-                for log in logs:
-                    try:
+                try:
+                    logs = driver.get_log("performance")
+                    for log in logs:
                         message = json.loads(log["message"])["message"]
                         if message["method"] == "Network.requestWillBeSent":
                             url = message["params"]["request"]["url"]
@@ -174,8 +174,8 @@ def get_video_and_audio_url(video_dict):
 
                             if video_url and audio_url:
                                 break
-                    except Exception as e:
-                        print(f"Error processing log: {e}")
+                except Exception as e:
+                    print(f"Error getting logs: {e}")
 
             print(f"url: {video['url']}")
             print(f"Video URL: {video_url}")
@@ -210,11 +210,11 @@ def merge_video_audio(video_path, audio_path, output_path, use_gpu):
     """
     command_gpu = [
         "ffmpeg",
-        "-hwaccel", "cuda",        # Sử dụng CUDA để tăng tốc phần cứng
+        "-hwaccel", "cuda",        
         "-i", video_path,
         "-i", audio_path,
-        "-c:v", "h264_nvenc",      # Sử dụng mã hóa GPU (NVIDIA NVENC)
-        "-preset", "fast",         # Tùy chỉnh tốc độ mã hóa (fast, slow, etc.)
+        "-c:v", "h264_nvenc",      
+        "-preset", "fast",         
         "-c:a", "aac",             # Sử dụng AAC cho audio
         "-b:a", "192k",            # Bitrate của audio
         output_path
