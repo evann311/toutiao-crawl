@@ -8,6 +8,7 @@ import argparse
 import threading
 import logging
 from datetime import datetime
+from urllib.parse import urlparse
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -49,10 +50,13 @@ if HEADLESS:
 def sanitize_filename(filename):
     sanitized = filename.replace("，", "")
     sanitized = sanitized.replace(" ", "")
+    # Remove any other characters that are invalid in filenames
+    sanitized = re.sub(r'[\\/:"*?<>|]+', '', sanitized)
     return sanitized
 
 
 def get_channel_token(url):
+    # Assuming the channel URL contains 'token/<token_value>'
     m = re.search(r"token/([^/?]+)", url)
     return m.group(1) if m else None
 
@@ -87,7 +91,8 @@ def download_file(url, filepath):
     except Exception as e:
         logger.error(f"Exception while downloading {url}: {e}")
 
-def download_merge_cleanup(v_url, a_url, out_file, temp_v, temp_a, use_gpu=False):
+
+def download_merge_cleanup(v_url, a_url, out_file, temp_v, temp_a, use_gpu=False, video_id=None, downloaded_manager=None):
     """
     Downloads video and audio, merges them, and cleans up temporary files.
     """
@@ -95,7 +100,9 @@ def download_merge_cleanup(v_url, a_url, out_file, temp_v, temp_a, use_gpu=False
         download_file(v_url, temp_v)
         download_file(a_url, temp_a)
         merge_video_audio(temp_v, temp_a, out_file, use_gpu)
-        
+        # After successful download and merge, add to downloaded_manager
+        if downloaded_manager and video_id:
+            downloaded_manager.add_downloaded(video_id)
     except Exception as e:
         logger.error(f"Error during download and merge: {e}")
     finally:
@@ -110,7 +117,6 @@ def download_merge_cleanup(v_url, a_url, out_file, temp_v, temp_a, use_gpu=False
             logger.error(f"Error during cleanup: {cleanup_error}")
 
 
-
 def merge_video_audio(video_path, audio_path, output_path, use_gpu=False):
     logger.info(f"Merging video: {video_path} + audio: {audio_path} -> {output_path}")
     rmd_gpu = [
@@ -121,7 +127,7 @@ def merge_video_audio(video_path, audio_path, output_path, use_gpu=False):
         "ffmpeg", "-i", video_path, "-i", audio_path,
         "-c:v", "copy", "-c:a", "aac", "-strict", "experimental", output_path
     ]
-    cmd = cmd_gpu if use_gpu else cmd_cpu
+    cmd = rmd_gpu if use_gpu else cmd_cpu
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         logger.info(f"Merged successfully: {output_path}")
@@ -152,14 +158,67 @@ class TaskQueue:
         logger.debug(f"Started new thread: {thread.name}")
 
     def wait_completion(self):
-        # Chờ cho đến khi tất cả các semaphore được giải phóng
-        # (nghĩa là tất cả các tác vụ đã hoàn thành)
-        for _ in range(self.semaphore._initial_value - self.semaphore._value):
-            self.semaphore.acquire()
+        # Wait until all semaphore permits are released
+        while self.semaphore._value < self.semaphore._initial_value:
+            time.sleep(1)
         logger.debug("All tasks have been completed.")
 
 
-def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
+class DownloadedManager:
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.downloaded_ids = set()
+        self.lock = threading.Lock()
+        self._load_downloaded()
+
+    def _load_downloaded(self):
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        video_id = line.strip()
+                        if video_id:
+                            self.downloaded_ids.add(video_id)
+                logger.debug(f"Loaded {len(self.downloaded_ids)} downloaded video IDs.")
+            except Exception as e:
+                logger.error(f"Error loading downloaded IDs from {self.filepath}: {e}")
+        else:
+            logger.debug(f"No existing downloaded file found at {self.filepath}.")
+
+    def is_downloaded(self, video_id):
+        with self.lock:
+            return video_id in self.downloaded_ids
+
+    def add_downloaded(self, video_id):
+        with self.lock:
+            if video_id not in self.downloaded_ids:
+                self.downloaded_ids.add(video_id)
+                try:
+                    with open(self.filepath, "a", encoding="utf-8") as f:
+                        f.write(f"{video_id}\n")
+                    logger.debug(f"Added video ID to downloaded list: {video_id}")
+                except Exception as e:
+                    logger.error(f"Error writing video ID {video_id} to {self.filepath}: {e}")
+
+
+def extract_video_id(url):
+    try:
+        parsed_url = urlparse(url)
+        path_segments = parsed_url.path.strip("/").split("/")
+        if len(path_segments) >= 2 and path_segments[-2] == 'video':
+            video_id = path_segments[-1]
+            return video_id
+        else:
+            # Handle URLs without trailing slash
+            m = re.search(r"/video/(\d+)", parsed_url.path)
+            if m:
+                return m.group(1)
+    except Exception as e:
+        logger.error(f"Error extracting video ID from URL {url}: {e}")
+    return None
+
+
+def crawl_and_download_from_channel(channel_url, task_queue, downloaded_manager, use_gpu=False):
     """
     Hàm duy nhất để:
       1) Mở channel
@@ -169,13 +228,13 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
     """
     logger.info(f"====> CRAWLING CHANNEL: {channel_url}")
     try:
-        # Mở channel ở chế độ non-headless (theo logic ban đầu).
+        # Open channel in non-headless mode (as per initial logic).
         driver = webdriver.Chrome(service=Service(DRIVER_PATH), options=options_first)
         driver.get(channel_url)
         logger.debug("Opened channel URL in browser.")
-        time.sleep(5)  # Cho page load
+        time.sleep(5)  # Wait for page to load
 
-        # Scroll để load hết video
+        # Scroll to load all videos
         def scroll():
             logger.info(f"Scrolling channel page up to {MAX_PAGE} times...")
             last_height = driver.execute_script("return document.body.scrollHeight")
@@ -198,30 +257,30 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
 
         scroll()
 
-        # Tìm các element video
+        # Find video elements
         els = driver.find_elements(By.CLASS_NAME, 'feed-card-video-multi-item')
         logger.info(f"Found {len(els)} video elements on channel page.")
 
-        # Lấy token channel (nếu có)
+        # Get channel token (if any)
         channel_token = get_channel_token(channel_url)
         if not channel_token:
             logger.warning(f"No token found in URL: {channel_url}, skip.")
             driver.quit()
             return
 
-        # Tạo folder output
+        # Create output folder
         result_dir = os.path.join(os.getcwd(), 'result')
         os.makedirs(result_dir, exist_ok=True)
         channel_dir = os.path.join(result_dir, channel_token)
         os.makedirs(channel_dir, exist_ok=True)
         logger.debug(f"Created channel directory: {channel_dir}")
 
-        # Tạo folder temp
+        # Create temp folder
         temp_dir = os.path.join(os.getcwd(), 'temp')
         os.makedirs(temp_dir, exist_ok=True)
         logger.debug(f"Created temp directory: {temp_dir}")
 
-        # Vòng lặp từng video -> tìm URL video/audio -> tải & merge
+        # Iterate through each video element to find video/audio URLs and download
         for idx, el in enumerate(els, 1):
             logger.info(f"\n--- Video element #{idx} ---")
             try:
@@ -232,7 +291,7 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
                 time_el = el.find_element(By.CLASS_NAME, "feed-card-footer-time-cmp").text
                 t = None
                 try:
-                    # Đôi khi format thời gian có thể khác, tuỳ trang
+                    # Sometimes the time format might differ, adjust as per the site
                     t = datetime.strptime(time_el, "%Y年%m月%d日")
                 except ValueError:
                     logger.debug(f"Time format not matched for '{time_el}'")
@@ -244,13 +303,26 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
                 publish_time = t.strftime("%Y-%m-%d") if t else "unknown_date"
                 logger.info(f"Title: {title}, URL: {href}, Time: {publish_time}")
 
-                # Kiểm tra đã tải chưa
-                out_file = os.path.join(channel_dir, f"{sanitized_title}.mp4")
-                if os.path.exists(out_file):
-                    logger.info(f"--> {out_file} exists, skip.")
+                # Extract video ID from URL (assuming it's the numeric part after /video/)
+                video_id = extract_video_id(href)
+                if not video_id:
+                    logger.warning(f"Could not extract video ID from URL: {href}, skip.")
                     continue
 
-                # 1) Mở webdriver thứ 2 (có thể headless hoặc không) để tìm src
+                # Check if already downloaded using DownloadedManager
+                if downloaded_manager.is_downloaded(video_id):
+                    logger.info(f"--> Video ID {video_id} already downloaded, skip.")
+                    continue
+
+                # Check if the output file already exists
+                out_file = os.path.join(channel_dir, f"{sanitized_title}.mp4")
+                if os.path.exists(out_file):
+                    logger.info(f"--> {out_file} exists, skipping download.")
+                    # Even if the file exists, ensure the video ID is recorded
+                    downloaded_manager.add_downloaded(video_id)
+                    continue
+
+                # 1) Open a second webdriver (can be headless or not) to find src
                 options_sub.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
 
                 logger.info("Opening video page to find source URLs...")
@@ -270,7 +342,7 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
                     sub_driver.quit()
                     continue
 
-                # 2) Tìm thử single source (video_src)
+                # 2) Try finding single source (video_src)
                 video_src = None
                 try:
                     vid_el = sub_driver.find_element(
@@ -282,15 +354,17 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
                 except Exception as e:
                     logger.warning(f"Cannot find <video> element or src: {e}")
 
-                # Nếu có single-source và không phải blob:
+                # If single-source and not blob:
                 if video_src and not video_src.startswith("blob:"):
                     logger.info(f"Single-source detected: {video_src}")
                     sub_driver.quit()
-                    # Tải trực tiếp bằng cách thêm vào task queue
+                    # Add to task queue for direct download
                     task_queue.add_task(download_file, video_src, out_file)
+                    # After successful download, add to downloaded_manager
+                    downloaded_manager.add_downloaded(video_id)
                     continue
 
-                # 3) Nếu là splitted source, duyệt log để tìm
+                # 3) If splitted source, browse logs to find
                 logger.info("Splitted source suspected, checking logs...")
                 v_url, a_url = None, None
                 start_t = time.time()
@@ -322,17 +396,26 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
 
                 sub_driver.quit()
 
-                # 4) Tiến hành tải nếu đã có link
+                # 4) Proceed to download if links are found
                 if not v_url and not video_src:
                     logger.warning("No valid video src found, skip this video.")
                     continue
 
                 if v_url and a_url:
-                    # Tải video và audio rồi merge bằng cách thêm vào task queue
+                    # Download video and audio then merge by adding to task queue
                     tmp_v = os.path.join(temp_dir, f"{sanitized_title}.mp4")
                     tmp_a = os.path.join(temp_dir, f"{sanitized_title}.m4a")
-                    task_queue.add_task(download_merge_cleanup, v_url, a_url, out_file, tmp_v, tmp_a, args.gpu)
-
+                    task_queue.add_task(
+                        download_merge_cleanup,
+                        v_url,
+                        a_url,
+                        out_file,
+                        tmp_v,
+                        tmp_a,
+                        use_gpu,
+                        video_id=video_id,
+                        downloaded_manager=downloaded_manager
+                    )
 
             except Exception as e:
                 logger.error(f"Error on element #{idx}: {e}")
@@ -353,13 +436,16 @@ if __name__ == "__main__":
     if args.url_file:
         logger.info("Starting downloader...")
         channels = get_channel_url_from_txt(args.url_file)
-        
+
         # Initialize TaskQueue with desired maximum threads
         task_queue = TaskQueue(max_threads=MAX_THREADS)
-        
+
+        # Initialize DownloadedManager with the path to the downloaded IDs file
+        downloaded_manager = DownloadedManager(filepath="downloaded.txt")
+
         for ch_url in channels:
-            crawl_and_download_from_channel(ch_url, task_queue, use_gpu=args.gpu)
-        
+            crawl_and_download_from_channel(ch_url, task_queue, downloaded_manager, use_gpu=args.gpu)
+
         # Wait for all tasks to complete
         task_queue.wait_completion()
         logger.info("All downloads and merges are complete.")
