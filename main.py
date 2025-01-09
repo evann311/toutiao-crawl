@@ -199,7 +199,7 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
         scroll()
 
         # Tìm các element video
-        els = driver.find_elements(By.CLASS_NAME, 'profile-normal-video-card')
+        els = driver.find_elements(By.CLASS_NAME, 'feed-card-video-multi-item')
         logger.info(f"Found {len(els)} video elements on channel page.")
 
         # Lấy token channel (nếu có)
@@ -238,7 +238,7 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
                     logger.debug(f"Time format not matched for '{time_el}'")
                     pass
 
-                href = el.find_element(By.CLASS_NAME, "r-content") \
+                href = el.find_element(By.CLASS_NAME, "feed-card-cover") \
                          .find_element(By.TAG_NAME, "a") \
                          .get_attribute("href")
                 publish_time = t.strftime("%Y-%m-%d") if t else "unknown_date"
