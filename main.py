@@ -46,6 +46,12 @@ if HEADLESS:
     options_sub.add_argument('--headless')
 
 
+def sanitize_filename(filename):
+    sanitized = filename.replace("，", "")
+    sanitized = sanitized.replace(" ", "")
+    return sanitized
+
+
 def get_channel_token(url):
     m = re.search(r"token/([^/?]+)", url)
     return m.group(1) if m else None
@@ -81,10 +87,33 @@ def download_file(url, filepath):
     except Exception as e:
         logger.error(f"Exception while downloading {url}: {e}")
 
+def download_merge_cleanup(v_url, a_url, out_file, temp_v, temp_a, use_gpu=False):
+    """
+    Downloads video and audio, merges them, and cleans up temporary files.
+    """
+    try:
+        download_file(v_url, temp_v)
+        download_file(a_url, temp_a)
+        merge_video_audio(temp_v, temp_a, out_file, use_gpu)
+        
+    except Exception as e:
+        logger.error(f"Error during download and merge: {e}")
+    finally:
+        try:
+            if os.path.exists(temp_v):
+                os.remove(temp_v)
+                logger.debug(f"Removed temporary video file: {temp_v}")
+            if os.path.exists(temp_a):
+                os.remove(temp_a)
+                logger.debug(f"Removed temporary audio file: {temp_a}")
+        except Exception as cleanup_error:
+            logger.error(f"Error during cleanup: {cleanup_error}")
+
+
 
 def merge_video_audio(video_path, audio_path, output_path, use_gpu=False):
     logger.info(f"Merging video: {video_path} + audio: {audio_path} -> {output_path}")
-    cmd_gpu = [
+    rmd_gpu = [
         "ffmpeg", "-hwaccel", "cuda", "-i", video_path, "-i", audio_path,
         "-c:v", "h264_nvenc", "-preset", "fast", "-c:a", "aac", "-b:a", "192k", output_path
     ]
@@ -198,6 +227,8 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
             try:
                 title_el = el.find_element(By.TAG_NAME, "a")
                 title = title_el.get_attribute("title") or f"video_{idx}"
+                # Sanitize title to remove spaces and invalid characters
+                sanitized_title = sanitize_filename(title)
                 time_el = el.find_element(By.CLASS_NAME, "feed-card-footer-time-cmp").text
                 t = None
                 try:
@@ -214,7 +245,7 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
                 logger.info(f"Title: {title}, URL: {href}, Time: {publish_time}")
 
                 # Kiểm tra đã tải chưa
-                out_file = os.path.join(channel_dir, f"{title}.mp4")
+                out_file = os.path.join(channel_dir, f"{sanitized_title}.mp4")
                 if os.path.exists(out_file):
                     logger.info(f"--> {out_file} exists, skip.")
                     continue
@@ -298,25 +329,10 @@ def crawl_and_download_from_channel(channel_url, task_queue, use_gpu=False):
 
                 if v_url and a_url:
                     # Tải video và audio rồi merge bằng cách thêm vào task queue
-                    tmp_v = os.path.join(temp_dir, f"{title}.mp4")
-                    tmp_a = os.path.join(temp_dir, f"{title}.m4a")
-                    task_queue.add_task(download_file, v_url, tmp_v)
-                    task_queue.add_task(download_file, a_url, tmp_a)
-                    task_queue.add_task(merge_video_audio, tmp_v, tmp_a, out_file, use_gpu)
+                    tmp_v = os.path.join(temp_dir, f"{sanitized_title}.mp4")
+                    tmp_a = os.path.join(temp_dir, f"{sanitized_title}.m4a")
+                    task_queue.add_task(download_merge_cleanup, v_url, a_url, out_file, tmp_v, tmp_a, args.gpu)
 
-                    # Xoá file tạm sau khi merge được đảm bảo trong hàm merge_video_audio
-                    def cleanup(tmp_video, tmp_audio):
-                        try:
-                            if os.path.exists(tmp_video):
-                                os.remove(tmp_video)
-                                logger.debug(f"Removed temporary video file: {tmp_video}")
-                            if os.path.exists(tmp_audio):
-                                os.remove(tmp_audio)
-                                logger.debug(f"Removed temporary audio file: {tmp_audio}")
-                        except Exception as e:
-                            logger.error(f"Error during cleanup: {e}")
-
-                    task_queue.add_task(cleanup, tmp_v, tmp_a)
 
             except Exception as e:
                 logger.error(f"Error on element #{idx}: {e}")
