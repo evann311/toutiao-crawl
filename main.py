@@ -48,11 +48,13 @@ if HEADLESS:
 
 
 def sanitize_filename(filename):
-    sanitized = filename.replace("，", "")
-    sanitized = sanitized.replace(" ", "")
-    # Remove any other characters that are invalid in filenames
-    sanitized = re.sub(r'[\\/:"*?<>|]+', '', sanitized)
-    return sanitized
+    # sanitized = filename.replace("，", "")
+    # sanitized = sanitized.replace(" ", "")
+
+    # sanitized = re.sub(r'[\\/:"*?<>|]+', '', sanitized)
+    # return sanitized
+
+    return filename
 
 
 def get_channel_token(url):
@@ -79,7 +81,8 @@ def get_channel_url_from_txt(path):
 def download_file(url, filepath):
     logger.info(f"Downloading to: {filepath}")
     try:
-        r = requests.get(url, stream=True)
+        # Thêm timeout cho request
+        r = requests.get(url, stream=True, timeout=30)
         if r.status_code == 200:
             with open(filepath, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024):
@@ -93,9 +96,6 @@ def download_file(url, filepath):
 
 
 def download_merge_cleanup(v_url, a_url, out_file, temp_v, temp_a, use_gpu=False, video_id=None, downloaded_manager=None):
-    """
-    Downloads video and audio, merges them, and cleans up temporary files.
-    """
     try:
         download_file(v_url, temp_v)
         download_file(a_url, temp_a)
@@ -140,19 +140,23 @@ class TaskQueue:
         self.semaphore = threading.Semaphore(max_threads)
         self.lock = threading.Lock()
 
-    def worker(self, func, args):
+    def worker(self, func, args, kwargs):
         try:
-            logger.debug(f"Starting task: {func.__name__} with args: {args}")
-            func(*args)
-            logger.debug(f"Completed task: {func.__name__} with args: {args}")
+            logger.debug(f"Starting task: {func.__name__} with args: {args} and kwargs: {kwargs}")
+            func(*args, **kwargs)
+            logger.debug(f"Completed task: {func.__name__} with args: {args} and kwargs: {kwargs}")
         except Exception as e:
-            logger.error(f"Error in task {func.__name__} with args {args}: {e}")
+            logger.error(f"Error in task {func.__name__} with args {args} and kwargs {kwargs}: {e}")
         finally:
             self.semaphore.release()
 
-    def add_task(self, func, *args):
+    def add_task(self, func, *args, **kwargs):
         self.semaphore.acquire()
-        thread = threading.Thread(target=self.worker, args=(func, args), name=f"Worker-{int(time.time()*1000)}")
+        thread = threading.Thread(
+            target=self.worker, 
+            args=(func, args, kwargs), 
+            name=f"Worker-{int(time.time()*1000)}"
+        )
         thread.daemon = True
         thread.start()
         logger.debug(f"Started new thread: {thread.name}")
@@ -216,6 +220,88 @@ def extract_video_id(url):
     except Exception as e:
         logger.error(f"Error extracting video ID from URL {url}: {e}")
     return None
+
+
+def scrape_sub_driver(href, use_gpu=False):
+    result = {"video_src": None, "v_url": None, "a_url": None}
+
+    sub_driver = None
+    try:
+        # 1) Open a second webdriver (can be headless or not) to find src
+        options_sub.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+
+        logger.info("Opening video page to find source URLs...")
+        sub_driver = webdriver.Chrome(service=Service(DRIVER_PATH), options=options_sub)
+        sub_driver.execute_cdp_cmd("Network.enable", {})
+        sub_driver.get(href)
+        logger.debug("Opened video URL in sub-browser.")
+        time.sleep(5)
+
+        # 2) Đợi đến khi xuất hiện <video>
+        try:
+            WebDriverWait(sub_driver, 20).until(
+                EC.presence_of_element_located((By.XPATH, '//*[@id="root"]/div/div[2]/div[1]/div/div[1]/ul/li[2]/div/video'))
+            )
+            logger.debug("Video element found on the page.")
+        except Exception as e:
+            logger.warning(f"Video element not found: {e}")
+            return result  # Trả về rỗng
+
+        # 3) Thử tìm single source (video_src)
+        try:
+            vid_el = sub_driver.find_element(
+                By.XPATH,
+                '//*[@id="root"]/div/div[2]/div[1]/div/div[1]/ul/li[2]/div/video'
+            )
+            video_src = vid_el.get_attribute("src")
+            logger.debug(f"Single video src found: {video_src}")
+        except Exception as e:
+            logger.warning(f"Cannot find <video> element or src: {e}")
+            video_src = None
+
+        if video_src and not video_src.startswith("blob:"):
+            # Single-source detected
+            logger.info(f"Single-source detected: {video_src}")
+            result["video_src"] = video_src
+            return result
+
+        # 4) Nếu là splitted source, browse logs để tìm
+        logger.info("Splitted source suspected, checking logs...")
+        v_url, a_url = None, None
+        start_t = time.time()
+        while True:
+            logs = sub_driver.get_log("performance")
+            for log_entry in logs:
+                try:
+                    msg = json.loads(log_entry["message"])["message"]
+                    if msg["method"] == "Network.requestWillBeSent":
+                        req_url = msg["params"]["request"]["url"]
+                        if "/media-video-avc1/" in req_url and not v_url:
+                            v_url = req_url
+                            logger.debug(f"Found video URL in logs: {v_url}")
+                        elif "/media-audio-und-mp4a/" in req_url and not a_url:
+                            a_url = req_url
+                            logger.debug(f"Found audio URL in logs: {a_url}")
+                        if v_url and a_url:
+                            break
+                except Exception as e:
+                    logger.debug(f"Error parsing log entry: {e}")
+            if v_url and a_url:
+                logger.info(f"Video URL: {v_url}")
+                logger.info(f"Audio URL: {a_url}")
+                result["v_url"] = v_url
+                result["a_url"] = a_url
+                break
+            if time.time() - start_t > 30:
+                logger.warning("Timeout: could not find splitted source URLs.")
+                break
+            time.sleep(1)
+
+        return result
+
+    finally:
+        if sub_driver:
+            sub_driver.quit()
 
 
 def crawl_and_download_from_channel(channel_url, task_queue, downloaded_manager, use_gpu=False):
@@ -322,87 +408,43 @@ def crawl_and_download_from_channel(channel_url, task_queue, downloaded_manager,
                     downloaded_manager.add_downloaded(video_id)
                     continue
 
-                # 1) Open a second webdriver (can be headless or not) to find src
-                options_sub.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+                # -------------------- THÊM PHẦN THREAD ĐỂ TIMEOUT --------------------
+                TIMEOUT_SUBDRIVER = 30  # Thời gian tối đa (giây) để sub_driver scrape
+                scrape_result_container = {}
 
-                logger.info("Opening video page to find source URLs...")
-                sub_driver = webdriver.Chrome(service=Service(DRIVER_PATH), options=options_sub)
-                sub_driver.execute_cdp_cmd("Network.enable", {})
-                sub_driver.get(href)
-                logger.debug("Opened video URL in sub-browser.")
-                time.sleep(5)
+                def thread_target():
+                    # Hàm này gọi scrape_sub_driver để lấy link video
+                    scrape_result_container["data"] = scrape_sub_driver(href, use_gpu=use_gpu)
 
-                try:
-                    WebDriverWait(sub_driver, 10).until(
-                        EC.presence_of_element_located((By.XPATH, '//*[@id="root"]/div/div[2]/div[1]/div/div[1]/ul/li[2]/div/video'))
-                    )
-                    logger.debug("Video element found on the page.")
-                except Exception as e:
-                    logger.warning(f"Video element not found: {e}")
-                    sub_driver.quit()
+                th = threading.Thread(target=thread_target)
+                th.start()
+                th.join(TIMEOUT_SUBDRIVER)
+
+                if th.is_alive():
+                    # sub_driver đang treo quá lâu
+                    logger.warning(f"Timeout {TIMEOUT_SUBDRIVER}s -> skip this video.")
+                    # Thông thường ta nên kill cứng driver, 
+                    # nhưng ở đây ta đã 'quit()' trong finally => driver sẽ thoát khi thread kết thúc.
+                    # Ta chỉ "bỏ qua video" và sang video tiếp theo
                     continue
 
-                # 2) Try finding single source (video_src)
-                video_src = None
-                try:
-                    vid_el = sub_driver.find_element(
-                        By.XPATH,
-                        '//*[@id="root"]/div/div[2]/div[1]/div/div[1]/ul/li[2]/div/video'
-                    )
-                    video_src = vid_el.get_attribute("src")
-                    logger.debug(f"Single video src found: {video_src}")
-                except Exception as e:
-                    logger.warning(f"Cannot find <video> element or src: {e}")
+                # Nếu không treo, lấy dữ liệu
+                result_data = scrape_result_container.get("data", {})
+                video_src = result_data.get("video_src")
+                v_url = result_data.get("v_url")
+                a_url = result_data.get("a_url")
 
-                # If single-source and not blob:
-                if video_src and not video_src.startswith("blob:"):
+                # 4) Proceed to download
+                if video_src:
+                    # Single-source
                     logger.info(f"Single-source detected: {video_src}")
-                    sub_driver.quit()
                     # Add to task queue for direct download
                     task_queue.add_task(download_file, video_src, out_file)
                     # After successful download, add to downloaded_manager
                     downloaded_manager.add_downloaded(video_id)
                     continue
-
-                # 3) If splitted source, browse logs to find
-                logger.info("Splitted source suspected, checking logs...")
-                v_url, a_url = None, None
-                start_t = time.time()
-                while True:
-                    logs = sub_driver.get_log("performance")
-                    for log in logs:
-                        try:
-                            msg = json.loads(log["message"])["message"]
-                            if msg["method"] == "Network.requestWillBeSent":
-                                req_url = msg["params"]["request"]["url"]
-                                if "/media-video-avc1/" in req_url and not v_url:
-                                    v_url = req_url
-                                    logger.debug(f"Found video URL in logs: {v_url}")
-                                elif "/media-audio-und-mp4a/" in req_url and not a_url:
-                                    a_url = req_url
-                                    logger.debug(f"Found audio URL in logs: {a_url}")
-                                if v_url and a_url:
-                                    break
-                        except Exception as e:
-                            logger.debug(f"Error parsing log entry: {e}")
-                    if v_url and a_url:
-                        logger.info(f"Video URL: {v_url}")
-                        logger.info(f"Audio URL: {a_url}")
-                        break
-                    if time.time() - start_t > 30:
-                        logger.warning("Timeout: could not find splitted source URLs.")
-                        break
-                    time.sleep(1)
-
-                sub_driver.quit()
-
-                # 4) Proceed to download if links are found
-                if not v_url and not video_src:
-                    logger.warning("No valid video src found, skip this video.")
-                    continue
-
-                if v_url and a_url:
-                    # Download video and audio then merge by adding to task queue
+                elif v_url and a_url:
+                    logger.info(f"Splitted source: v_url={v_url}, a_url={a_url}")
                     tmp_v = os.path.join(temp_dir, f"{sanitized_title}.mp4")
                     tmp_a = os.path.join(temp_dir, f"{sanitized_title}.m4a")
                     task_queue.add_task(
@@ -416,6 +458,8 @@ def crawl_and_download_from_channel(channel_url, task_queue, downloaded_manager,
                         video_id=video_id,
                         downloaded_manager=downloaded_manager
                     )
+                else:
+                    logger.warning("No valid video src found, skip this video.")
 
             except Exception as e:
                 logger.error(f"Error on element #{idx}: {e}")
